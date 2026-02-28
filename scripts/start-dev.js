@@ -35,12 +35,36 @@ if (!binDir) {
 }
 
 const cliName = platform === 'win32' ? 'codex.exe' : 'codex';
-const cliPath = path.join(__dirname, '..', 'resources', 'bin', binDir, cliName);
+const localCliPath = path.join(__dirname, '..', 'resources', 'bin', binDir, cliName);
+
+// 平台 -> target triple 映射（与 forge.config.js 保持一致）
+const TARGET_TRIPLE_MAP = {
+  'darwin-arm64': 'aarch64-apple-darwin',
+  'darwin-x64': 'x86_64-apple-darwin',
+  'linux-arm64': 'aarch64-unknown-linux-musl',
+  'linux-x64': 'x86_64-unknown-linux-musl',
+  'win32-x64': 'x86_64-pc-windows-msvc',
+};
+
+// 从 npm vendor 同步到 resources/bin/
+const triple = TARGET_TRIPLE_MAP[binDir];
+if (triple) {
+  const vendorPath = path.join(__dirname, '..', 'node_modules', '@cometix', 'codex', 'vendor', triple, 'codex', cliName);
+  if (fs.existsSync(vendorPath)) {
+    const localDir = path.join(__dirname, '..', 'resources', 'bin', binDir);
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.copyFileSync(vendorPath, path.join(localDir, cliName));
+    try { fs.chmodSync(path.join(localDir, cliName), 0o755); } catch {}
+    console.log(`[start-dev] Synced codex binary: vendor → resources/bin/${binDir}/${cliName}`);
+  }
+}
+
+const cliPath = localCliPath;
 
 // Verify CLI exists
 if (!fs.existsSync(cliPath)) {
   console.error(`CLI not found at: ${cliPath}`);
-  console.error('Please ensure the CLI binary exists in resources/bin/');
+  console.error('Tried: resources/bin/ and node_modules/@cometix/codex/vendor/');
   process.exit(1);
 }
 

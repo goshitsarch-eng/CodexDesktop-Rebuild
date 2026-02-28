@@ -14,7 +14,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const acorn = require(require.resolve("acorn", { paths: [path.join(__dirname, "..")] }));
+const { parse } = require("acorn");
 
 // ─── 1. 定位 main bundle ─────────────────────────────────
 function locateBundle() {
@@ -113,7 +113,7 @@ function main() {
   console.log(`📏 文件大小: ${(source.length / 1048576).toFixed(1)} MB`);
 
   const t0 = Date.now();
-  const ast = acorn.parse(source, {
+  const ast = parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
   });

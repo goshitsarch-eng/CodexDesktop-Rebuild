@@ -2,11 +2,14 @@
  * 构建后补丁脚本：注入 English (en-US) 到语言选择器
  *
  * react-intl 以英语为 defaultMessage，不存在 en.json 翻译文件，
- * 导致 qNe() 返回的语言列表中没有英语选项。
+ * 导致语言列表中没有英语选项。
  * 当系统语言为非英语时，用户无法主动选择英文 UI。
  *
- * 本脚本通过 AST 精确匹配 qNe() 函数，在返回数组中注入 en-US 条目。
- * 选择英语后 LocaleProvider 检测到无对应翻译 → messages=undefined → 回退到 defaultMessage（英文）。
+ * 匹配策略（纯结构，不依赖压缩名）：
+ *   1. 定位 locale 数组变量：赋值源为 Object.entries(X).map(...).filter(...).sort(...)
+ *      且 map 回调中包含 .json 文件路径匹配
+ *   2. 定位返回 [...该变量] 的函数
+ *   3. 在 ArrayExpression 头部注入 en-US 条目
  *
  * 用法：
  *   node scripts/patch-i18n.js          # 执行 patch
@@ -14,10 +17,10 @@
  */
 const fs = require("fs");
 const path = require("path");
-const acorn = require(require.resolve("acorn", { paths: [path.join(__dirname, "..")] }));
+const { parse } = require("acorn");
 
 // ──────────────────────────────────────────────
-//  第 1 层：AST 引擎 — 解析 + 递归遍历
+//  AST 遍历
 // ──────────────────────────────────────────────
 
 function walk(node, visitor) {
@@ -38,63 +41,157 @@ function walk(node, visitor) {
 }
 
 // ──────────────────────────────────────────────
-//  第 2 层：声明式 Patch 规则
+//  第 1 步：定位 locale 数组变量名
+// ──────────────────────────────────────────────
+
+/**
+ * 在源码中查找形如：
+ *   VAR = Object.entries(X).map((...) => { ... .json ... }).filter(...).sort(...)
+ *
+ * 特征链：
+ *   - CallExpression: .sort(...)
+ *     - callee.object: CallExpression .filter(...)
+ *       - callee.object: CallExpression .map(...)
+ *         - callee.object: CallExpression Object.entries(X)
+ *   - map 回调体中包含 ".json" 字符串
+ *
+ * 返回变量名（Identifier.name）
+ */
+function findLocaleArrayName(ast, source) {
+  let varName = null;
+
+  walk(ast, (node) => {
+    if (varName) return; // 已找到
+
+    // 匹配赋值：VAR = expr
+    let assignTarget = null;
+    let assignValue = null;
+
+    if (node.type === "VariableDeclarator" && node.id?.type === "Identifier" && node.init) {
+      assignTarget = node.id.name;
+      assignValue = node.init;
+    } else if (node.type === "AssignmentExpression" && node.left?.type === "Identifier") {
+      assignTarget = node.left.name;
+      assignValue = node.right;
+    }
+
+    if (!assignTarget || !assignValue) return;
+
+    // 验证链式调用：.sort(..).filter(..).map(..)..Object.entries(..)
+    if (!isChainedCall(assignValue, ["sort", "filter", "map"])) return;
+
+    // 取 map 调用节点
+    const mapCall = getChainedCallAt(assignValue, "map");
+    if (!mapCall) return;
+
+    // map 回调体中应包含 ".json"
+    const mapSrc = source.slice(mapCall.start, mapCall.end);
+    if (!mapSrc.includes(".json")) return;
+
+    // 额外确认：map 回调中应有 locale/normalized/language 关键字
+    if (!mapSrc.includes("locale") && !mapSrc.includes("normalized")) return;
+
+    varName = assignTarget;
+  });
+
+  return varName;
+}
+
+/**
+ * 检查 node 是否为 X.method1(...).method2(...).method3(...) 链
+ * methods 从外到内：[sort, filter, map]
+ */
+function isChainedCall(node, methods) {
+  let current = node;
+  for (const method of methods) {
+    if (!current || current.type !== "CallExpression") return false;
+    const callee = current.callee;
+    if (!callee || callee.type !== "MemberExpression") return false;
+    const prop = callee.property;
+    if (!prop) return false;
+    const name = prop.type === "Identifier" ? prop.name : prop.type === "Literal" ? prop.value : null;
+    if (name !== method) return false;
+    current = callee.object; // 深入一层
+  }
+  return true;
+}
+
+/** 从链式调用中提取指定方法的 CallExpression 节点 */
+function getChainedCallAt(node, method) {
+  let current = node;
+  while (current && current.type === "CallExpression") {
+    const callee = current.callee;
+    if (callee?.type === "MemberExpression") {
+      const prop = callee.property;
+      const name = prop?.type === "Identifier" ? prop.name : null;
+      if (name === method) return current;
+      current = callee.object;
+    } else {
+      break;
+    }
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────
+//  第 2 步：定位返回 [...localeVar] 的函数并 patch
 // ──────────────────────────────────────────────
 
 const EN_US_ENTRY = '{locale:"en-US",normalized:"en-us",language:"en",load:()=>Promise.resolve({default:{}})}';
 
-const RULES = [
-  {
-    id: "inject_english_locale",
-    description: "qNe() 注入 English (en-US) locale 选项",
-    /**
-     * AST 匹配条件：
-     *   FunctionDeclaration — id.name === "qNe"
-     *   body 含 ReturnStatement，返回 ArrayExpression
-     *   ArrayExpression 内有 SpreadElement（...fX）
-     *
-     * 替换策略：
-     *   在 ArrayExpression 的首个元素前插入 en-US 对象
-     *   [...fX] → [{en-US entry},...fX]
-     */
-    match(node, source) {
-      if (node.type !== "FunctionDeclaration") return null;
-      if (!node.id || node.id.name !== "qNe") return null;
+function collectPatches(ast, source, localeVarName) {
+  const patches = [];
 
-      const body = node.body;
-      if (!body || body.type !== "BlockStatement") return null;
+  walk(ast, (node) => {
+    // 匹配任意函数类型
+    const body = getFunctionBody(node);
+    if (!body) return;
 
-      // 在函数体中找 ReturnStatement
-      const retStmt = body.body.find((s) => s.type === "ReturnStatement");
-      if (!retStmt) return null;
+    const statements = body.type === "BlockStatement" ? body.body : null;
+    if (!statements || statements.length !== 1) return;
 
-      const arg = retStmt.argument;
-      if (!arg || arg.type !== "ArrayExpression") return null;
+    const retStmt = statements[0];
+    if (retStmt.type !== "ReturnStatement") return;
 
-      // 确认包含 SpreadElement
-      const hasSpread = arg.elements.some((el) => el && el.type === "SpreadElement");
-      if (!hasSpread) return null;
+    const arg = retStmt.argument;
+    if (!arg || arg.type !== "ArrayExpression") return;
+    if (arg.elements.length !== 1) return;
 
-      // 幂等：如果函数体中已含 "en-US" 则跳过
-      const funcSrc = source.slice(node.start, node.end);
-      if (funcSrc.includes('"en-US"')) return null;
+    const spread = arg.elements[0];
+    if (!spread || spread.type !== "SpreadElement") return;
+    if (spread.argument?.type !== "Identifier") return;
+    if (spread.argument.name !== localeVarName) return;
 
-      const original = source.slice(arg.start, arg.end);
-      // 提取 spread 部分（从 [ 后到 ] 前的内容）
-      const inner = original.slice(1, -1).trim();
+    // 幂等检查
+    const funcSrc = source.slice(node.start, node.end);
+    if (funcSrc.includes('"en-US"')) return;
 
-      return {
-        start: arg.start,
-        end: arg.end,
-        replacement: `[${EN_US_ENTRY},${inner}]`,
-        original,
-      };
-    },
-  },
-];
+    const original = source.slice(arg.start, arg.end);
+    const inner = original.slice(1, -1).trim();
+
+    patches.push({
+      start: arg.start,
+      end: arg.end,
+      replacement: `[${EN_US_ENTRY},${inner}]`,
+      original,
+    });
+  });
+
+  return patches;
+}
+
+function getFunctionBody(node) {
+  if (node.type === "FunctionDeclaration" || node.type === "FunctionExpression") {
+    return node.body;
+  }
+  if (node.type === "ArrowFunctionExpression") {
+    return node.body;
+  }
+  return null;
+}
 
 // ──────────────────────────────────────────────
-//  第 3 层：文件定位 + 外科替换
+//  文件定位
 // ──────────────────────────────────────────────
 
 function locateBundle() {
@@ -133,47 +230,43 @@ function main() {
   console.log(`📏 文件大小: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
   const t0 = Date.now();
-  const ast = acorn.parse(source, {
+  const ast = parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
   });
   console.log(`🔍 AST 解析: ${Date.now() - t0}ms`);
 
-  // 收集 patches
-  const patches = [];
-  const seen = new Set();
+  // 第 1 步：定位 locale 数组变量名
+  const localeVarName = findLocaleArrayName(ast, source);
+  if (!localeVarName) {
+    console.log("\n⚠️  未找到 locale 数组变量（Object.entries → map → filter → sort 链）");
+    return;
+  }
+  console.log(`📌 locale 数组变量: ${localeVarName}`);
 
-  walk(ast, (node) => {
-    for (const rule of RULES) {
-      const result = rule.match(node, source);
-      if (result && !seen.has(result.start)) {
-        seen.add(result.start);
-        patches.push({ ...result, ruleId: rule.id, description: rule.description });
-      }
-    }
-  });
+  // 第 2 步：定位返回 [...localeVar] 的函数并收集 patch
+  const patches = collectPatches(ast, source, localeVarName);
 
   if (patches.length === 0) {
-    console.log("\n✅ 无需修改（English locale 已注入或 qNe 不匹配）");
+    console.log("\n✅ 无需修改（English locale 已注入或未找到返回函数）");
     return;
   }
 
   if (isCheck) {
     console.log(`\n🔎 匹配报告: ${patches.length} 处`);
     for (const p of patches) {
-      console.log(`  📍 [${p.ruleId}] 位置 ${p.start}`);
+      console.log(`  📍 位置 ${p.start}`);
       console.log(`     原始: ${p.original.slice(0, 80)}${p.original.length > 80 ? "..." : ""}`);
       console.log(`     替换: ${p.replacement.slice(0, 80)}${p.replacement.length > 80 ? "..." : ""}`);
     }
     return;
   }
 
-  // 按 start 降序排列（从后往前替换，避免偏移漂移）
   patches.sort((a, b) => b.start - a.start);
 
   let code = source;
   for (const p of patches) {
-    console.log(`  ✏️  [${p.ruleId}] 位置 ${p.start}: 注入 en-US 到语言列表`);
+    console.log(`  ✏️  位置 ${p.start}: 注入 en-US 到语言列表`);
     code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
   }
 
