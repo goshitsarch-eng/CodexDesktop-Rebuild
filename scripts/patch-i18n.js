@@ -1,14 +1,12 @@
 /**
- * 构建后补丁脚本：解锁 i18n 多语言功能
+ * 构建后补丁脚本：注入 English (en-US) 到语言选择器
  *
- * Codex 内置完整的 react-intl 多语言体系（59 语言、1,598 条翻译），
- * 但被 Statsig feature gate `codex-i18n` 控制。
+ * react-intl 以英语为 defaultMessage，不存在 en.json 翻译文件，
+ * 导致 qNe() 返回的语言列表中没有英语选项。
+ * 当系统语言为非英语时，用户无法主动选择英文 UI。
  *
- * 即使修改 .get() 的默认值也不够 —— 当 Statsig 后端可达时，
- * 服务端返回的 enable_i18n=false 会覆盖默认值。
- *
- * 因此本脚本直接将整个 gate 调用 `?.get("enable_i18n", ...)` 替换为 `!0`，
- * 彻底绕过 Statsig 控制。
+ * 本脚本通过 AST 精确匹配 qNe() 函数，在返回数组中注入 en-US 条目。
+ * 选择英语后 LocaleProvider 检测到无对应翻译 → messages=undefined → 回退到 defaultMessage（英文）。
  *
  * 用法：
  *   node scripts/patch-i18n.js          # 执行 patch
@@ -16,7 +14,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { parse } = require("acorn");
+const acorn = require(require.resolve("acorn", { paths: [path.join(__dirname, "..")] }));
 
 // ──────────────────────────────────────────────
 //  第 1 层：AST 引擎 — 解析 + 递归遍历
@@ -24,16 +22,16 @@ const { parse } = require("acorn");
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
-  visitor(node);
+  if (node.type) visitor(node);
   for (const key of Object.keys(node)) {
     const child = node[key];
     if (Array.isArray(child)) {
       for (const item of child) {
-        if (item && typeof item.type === "string") {
+        if (item && typeof item === "object" && item.type) {
           walk(item, visitor);
         }
       }
-    } else if (child && typeof child.type === "string") {
+    } else if (child && typeof child === "object" && child.type) {
       walk(child, visitor);
     }
   }
@@ -43,76 +41,57 @@ function walk(node, visitor) {
 //  第 2 层：声明式 Patch 规则
 // ──────────────────────────────────────────────
 
-/**
- * 规则数组 — 可扩展
- *
- * 策略：替换整个 ?.get("enable_i18n", ...) 调用为 !0
- * 这样无论 Statsig 服务端返回什么值，i18n 都强制启用
- */
+const EN_US_ENTRY = '{locale:"en-US",normalized:"en-us",language:"en",load:()=>Promise.resolve({default:{}})}';
+
 const RULES = [
   {
-    id: "enable_i18n",
-    description: "gate 调用 ?.get(\"enable_i18n\", ...) → !0",
+    id: "inject_english_locale",
+    description: "qNe() 注入 English (en-US) locale 选项",
     /**
-     * 匹配条件：
-     *   CallExpression（可能被 ChainExpression 包裹）
-     *   - callee 是 MemberExpression，property.name === "get"
-     *   - arguments[0] 是 Literal "enable_i18n"
-     *   - arguments[1] 存在（任意值）
+     * AST 匹配条件：
+     *   FunctionDeclaration — id.name === "qNe"
+     *   body 含 ReturnStatement，返回 ArrayExpression
+     *   ArrayExpression 内有 SpreadElement（...fX）
      *
-     * 替换范围：整个 CallExpression（含 optional chain 包裹）
-     *   ?.get("enable_i18n", !1)  →  !0
-     *   ?.get("enable_i18n", !0)  →  !0
+     * 替换策略：
+     *   在 ArrayExpression 的首个元素前插入 en-US 对象
+     *   [...fX] → [{en-US entry},...fX]
      */
     match(node, source) {
-      // 匹配 ChainExpression 包裹的 CallExpression
-      // 或直接的 CallExpression
-      let callNode = null;
-      let replaceNode = null; // 需要替换的最外层节点
+      if (node.type !== "FunctionDeclaration") return null;
+      if (!node.id || node.id.name !== "qNe") return null;
 
-      if (node.type === "ChainExpression" && node.expression?.type === "CallExpression") {
-        callNode = node.expression;
-        replaceNode = node; // 替换整个 ChainExpression
-      } else if (node.type === "CallExpression") {
-        callNode = node;
-        replaceNode = node;
-      }
+      const body = node.body;
+      if (!body || body.type !== "BlockStatement") return null;
 
-      if (!callNode) return null;
+      // 在函数体中找 ReturnStatement
+      const retStmt = body.body.find((s) => s.type === "ReturnStatement");
+      if (!retStmt) return null;
 
-      const callee = callNode.callee;
-      if (!callee || callee.type !== "MemberExpression") return null;
-      if (getPropertyName(callee) !== "get") return null;
+      const arg = retStmt.argument;
+      if (!arg || arg.type !== "ArrayExpression") return null;
 
-      const args = callNode.arguments;
-      if (!args || args.length < 2) return null;
-      if (args[0].type !== "Literal" || args[0].value !== "enable_i18n") return null;
+      // 确认包含 SpreadElement
+      const hasSpread = arg.elements.some((el) => el && el.type === "SpreadElement");
+      if (!hasSpread) return null;
 
-      const original = source.slice(replaceNode.start, replaceNode.end);
+      // 幂等：如果函数体中已含 "en-US" 则跳过
+      const funcSrc = source.slice(node.start, node.end);
+      if (funcSrc.includes('"en-US"')) return null;
 
-      // 已经被 patch 过（整个表达式就是 !0）→ 跳过
-      if (original === "!0") return null;
+      const original = source.slice(arg.start, arg.end);
+      // 提取 spread 部分（从 [ 后到 ] 前的内容）
+      const inner = original.slice(1, -1).trim();
 
       return {
-        start: replaceNode.start,
-        end: replaceNode.end,
-        replacement: "!0",
+        start: arg.start,
+        end: arg.end,
+        replacement: `[${EN_US_ENTRY},${inner}]`,
         original,
       };
     },
   },
 ];
-
-function getPropertyName(memberExpr) {
-  if (!memberExpr || !memberExpr.property) return null;
-  if (!memberExpr.computed && memberExpr.property.type === "Identifier") {
-    return memberExpr.property.name;
-  }
-  if (memberExpr.computed && memberExpr.property.type === "Literal") {
-    return memberExpr.property.value;
-  }
-  return null;
-}
 
 // ──────────────────────────────────────────────
 //  第 3 层：文件定位 + 外科替换
@@ -139,77 +118,6 @@ function locateBundle() {
   return path.join(assetsDir, files[0]);
 }
 
-/**
- * 收集所有规则命中的 patch 点
- */
-function collectPatches(ast, source) {
-  const patches = [];
-  const details = [];
-  const seen = new Set(); // 防止 ChainExpression 和内部 CallExpression 重复命中
-
-  walk(ast, (node) => {
-    for (const rule of RULES) {
-      const result = rule.match(node, source);
-      if (result && !seen.has(result.start)) {
-        seen.add(result.start);
-        patches.push({ ...result, ruleId: rule.id });
-        details.push({
-          ruleId: rule.id,
-          position: result.start,
-          change: `${result.original} → ${result.replacement}`,
-        });
-      }
-    }
-  });
-
-  return { patches, details };
-}
-
-/**
- * 扫描所有匹配情况（用于 --check 模式）
- */
-function scanMatches(ast, source) {
-  const CONTEXT_CHARS = 40;
-  const matches = [];
-  const seen = new Set();
-
-  walk(ast, (node) => {
-    for (const rule of RULES) {
-      const result = rule.match(node, source);
-      if (result && !seen.has(result.start)) {
-        seen.add(result.start);
-        const ctxStart = Math.max(0, result.start - CONTEXT_CHARS);
-        const ctxEnd = Math.min(source.length, result.end + CONTEXT_CHARS);
-        matches.push({
-          ruleId: rule.id,
-          position: result.start,
-          original: result.original,
-          context: source.slice(ctxStart, ctxEnd),
-          wouldPatch: true,
-        });
-      }
-    }
-
-    // 也检测已 patch 的位置（原表达式已被替换为 !0）
-    // 这些不会被 rule.match 命中（因为 original === "!0" 会跳过）
-    // 无需额外处理，--check 只展示待 patch 的
-  });
-
-  return { matches };
-}
-
-/**
- * 统计所有 enable_i18n 相关调用（含已 patch 和未 patch）
- */
-function countAllOccurrences(source) {
-  let total = 0;
-  let idx = -1;
-  while ((idx = source.indexOf('"enable_i18n"', idx + 1)) !== -1) {
-    total++;
-  }
-  return total;
-}
-
 // ──────────────────────────────────────────────
 //  主流程
 // ──────────────────────────────────────────────
@@ -225,65 +133,52 @@ function main() {
   console.log(`📏 文件大小: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
   const t0 = Date.now();
-  const ast = parse(source, {
+  const ast = acorn.parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
   });
-  const parseTime = Date.now() - t0;
-  console.log(`🔍 AST 解析: ${parseTime}ms`);
+  console.log(`🔍 AST 解析: ${Date.now() - t0}ms`);
 
-  // ── --check 模式 ──
-  if (isCheck) {
-    console.log("\n── 匹配检查 (只读) ──\n");
-    const { matches } = scanMatches(ast, source);
-    const totalRefs = countAllOccurrences(source);
+  // 收集 patches
+  const patches = [];
+  const seen = new Set();
 
-    if (matches.length === 0) {
-      console.log(`📊 共 ${totalRefs} 处 "enable_i18n" 引用, 0 处待 patch`);
-      console.log("✅ 所有 gate 调用已被替换为 !0");
-    } else {
-      for (let i = 0; i < matches.length; i++) {
-        const m = matches[i];
-        console.log(`  #${i + 1}  [${m.ruleId}]  🔧 待 patch`);
-        console.log(`      位置: ${m.position}`);
-        console.log(`      原始: ${m.original}`);
-        console.log(`      上下文: ...${m.context}...`);
-        console.log();
+  walk(ast, (node) => {
+    for (const rule of RULES) {
+      const result = rule.match(node, source);
+      if (result && !seen.has(result.start)) {
+        seen.add(result.start);
+        patches.push({ ...result, ruleId: rule.id, description: rule.description });
       }
-      console.log(
-        `📊 共 ${totalRefs} 处 "enable_i18n" 引用, ${matches.length} 处待 patch`
-      );
     }
-    return;
-  }
-
-  // ── patch 模式 ──
-  const { patches, details } = collectPatches(ast, source);
+  });
 
   if (patches.length === 0) {
-    const totalRefs = countAllOccurrences(source);
-    if (totalRefs > 0) {
-      console.log(`ℹ️  i18n 已全部启用 (${totalRefs} 处引用, 0 处待 patch), 无需修改`);
-    } else {
-      console.warn("⚠️  未找到 enable_i18n feature flag");
+    console.log("\n✅ 无需修改（English locale 已注入或 qNe 不匹配）");
+    return;
+  }
+
+  if (isCheck) {
+    console.log(`\n🔎 匹配报告: ${patches.length} 处`);
+    for (const p of patches) {
+      console.log(`  📍 [${p.ruleId}] 位置 ${p.start}`);
+      console.log(`     原始: ${p.original.slice(0, 80)}${p.original.length > 80 ? "..." : ""}`);
+      console.log(`     替换: ${p.replacement.slice(0, 80)}${p.replacement.length > 80 ? "..." : ""}`);
     }
     return;
   }
 
-  // 按 start 降序排列，避免偏移漂移
+  // 按 start 降序排列（从后往前替换，避免偏移漂移）
   patches.sort((a, b) => b.start - a.start);
 
   let code = source;
   for (const p of patches) {
+    console.log(`  ✏️  [${p.ruleId}] 位置 ${p.start}: 注入 en-US 到语言列表`);
     code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
   }
 
-  fs.writeFileSync(bundlePath, code);
-
-  for (const d of details) {
-    console.log(`  ✏️  位置 ${d.position}: ${d.change}`);
-  }
-  console.log(`\n✅ i18n 已解锁: ${patches.length} 处 gate 调用 → !0`);
+  fs.writeFileSync(bundlePath, code, "utf-8");
+  console.log(`\n✅ English (en-US) 已注入语言选择器: ${patches.length} 处修改`);
 }
 
 main();

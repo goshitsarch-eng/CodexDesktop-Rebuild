@@ -11,10 +11,40 @@ const TARGET_TRIPLE_MAP = {
   "win32-x64": "x86_64-pc-windows-msvc",
 };
 
-// 获取 codex 二进制路径（优先本地，其次 npm）
+// 获取 @cometix/codex vendor 目录下的二进制路径
+function getVendorBinaryPath(platform, arch, subdir, binaryName) {
+  const platformArch = `${platform}-${arch}`;
+  const targetTriple = TARGET_TRIPLE_MAP[platformArch];
+  if (!targetTriple) return null;
+
+  const vendorPath = path.join(
+    __dirname, "node_modules", "@cometix", "codex", "vendor",
+    targetTriple, subdir, binaryName
+  );
+  return fs.existsSync(vendorPath) ? vendorPath : null;
+}
+
+// 从 npm vendor 复制二进制到 resources/bin/（确保本地始终为最新）
+function syncVendorToLocal(platform, arch) {
+  const platformArch = `${platform}-${arch}`;
+  const binaryName = platform === "win32" ? "codex.exe" : "codex";
+  const vendorPath = getVendorBinaryPath(platform, arch, "codex", binaryName);
+  if (!vendorPath) return;
+
+  const localDir = path.join(__dirname, "resources", "bin", platformArch);
+  fs.mkdirSync(localDir, { recursive: true });
+  fs.copyFileSync(vendorPath, path.join(localDir, binaryName));
+  fs.chmodSync(path.join(localDir, binaryName), 0o755);
+  console.log(`🔄 Synced codex binary: vendor → resources/bin/${platformArch}/${binaryName}`);
+}
+
+// 获取 codex 二进制路径（resources/bin 为主，npm vendor 为回退）
 function getCodexBinaryPath(platform, arch) {
   const platformArch = `${platform}-${arch}`;
   const binaryName = platform === "win32" ? "codex.exe" : "codex";
+
+  // 先从 npm vendor 同步到 resources/bin/
+  syncVendorToLocal(platform, arch);
 
   // 路径1: 本地 resources/bin/
   const localPath = path.join(__dirname, "resources", "bin", platformArch, binaryName);
@@ -22,19 +52,14 @@ function getCodexBinaryPath(platform, arch) {
     return localPath;
   }
 
-  // 路径2: npm @cometix/codex/vendor/
-  const targetTriple = TARGET_TRIPLE_MAP[platformArch];
-  if (targetTriple) {
-    const npmPath = path.join(
-      __dirname, "node_modules", "@cometix", "codex", "vendor",
-      targetTriple, "codex", binaryName
-    );
-    if (fs.existsSync(npmPath)) {
-      return npmPath;
-    }
-  }
+  // 路径2: npm @cometix/codex/vendor/（直接回退）
+  return getVendorBinaryPath(platform, arch, "codex", binaryName);
+}
 
-  return null;
+// 获取 rg (ripgrep) 二进制路径
+function getRgBinaryPath(platform, arch) {
+  const binaryName = platform === "win32" ? "rg.exe" : "rg";
+  return getVendorBinaryPath(platform, arch, "path", binaryName);
 }
 
 module.exports = {
@@ -497,17 +522,18 @@ module.exports = {
       );
     },
 
-    // 打包后复制对应平台的 codex 二进制
+    // 打包后复制对应平台的 codex + rg 二进制
     packageAfterCopy: async (config, buildPath, electronVersion, platform, arch) => {
       console.log(`\n📦 Packaging for ${platform}-${arch}...`);
       console.log(`   buildPath: ${buildPath}`);
 
-      const codexSrc = getCodexBinaryPath(platform, arch);
-      const binaryName = platform === "win32" ? "codex.exe" : "codex";
-
       // buildPath 指向 app 目录，其父目录即为 Resources (macOS) 或 resources (其他)
       const resourcesPath = path.dirname(buildPath);
-      const codexDest = path.join(resourcesPath, binaryName);
+
+      // --- 复制 codex 二进制 ---
+      const codexBinaryName = platform === "win32" ? "codex.exe" : "codex";
+      const codexSrc = getCodexBinaryPath(platform, arch);
+      const codexDest = path.join(resourcesPath, codexBinaryName);
 
       if (codexSrc && fs.existsSync(codexSrc)) {
         fs.copyFileSync(codexSrc, codexDest);
@@ -515,9 +541,36 @@ module.exports = {
         console.log(`✅ Copied codex binary: ${codexSrc} -> ${codexDest}`);
       } else {
         console.error(`❌ Codex binary not found for ${platform}-${arch}`);
-        console.error(`   Tried: resources/bin/${platform}-${arch}/${binaryName}`);
-        console.error(`   Tried: node_modules/@cometix/codex/vendor/.../codex/${binaryName}`);
+        console.error(`   Tried: resources/bin/${platform}-${arch}/${codexBinaryName}`);
+        console.error(`   Tried: node_modules/@cometix/codex/vendor/.../codex/${codexBinaryName}`);
         process.exit(1);
+      }
+
+      // --- 复制 Windows 附属二进制（sandbox-setup, command-runner）---
+      if (platform === "win32") {
+        const winExtras = ["codex-command-runner.exe", "codex-windows-sandbox-setup.exe"];
+        for (const extra of winExtras) {
+          const extraSrc = getVendorBinaryPath(platform, arch, "codex", extra);
+          if (extraSrc) {
+            const extraDest = path.join(resourcesPath, extra);
+            fs.copyFileSync(extraSrc, extraDest);
+            fs.chmodSync(extraDest, 0o755);
+            console.log(`✅ Copied ${extra}: ${extraSrc} -> ${extraDest}`);
+          }
+        }
+      }
+
+      // --- 复制 rg (ripgrep) 二进制 ---
+      const rgBinaryName = platform === "win32" ? "rg.exe" : "rg";
+      const rgSrc = getRgBinaryPath(platform, arch);
+      const rgDest = path.join(resourcesPath, rgBinaryName);
+
+      if (rgSrc) {
+        fs.copyFileSync(rgSrc, rgDest);
+        fs.chmodSync(rgDest, 0o755);
+        console.log(`✅ Copied rg binary: ${rgSrc} -> ${rgDest}`);
+      } else {
+        console.warn(`⚠️  rg binary not found for ${platform}-${arch}, skipping`);
       }
     },
   },

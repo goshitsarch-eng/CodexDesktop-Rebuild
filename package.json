@@ -1,34 +1,26 @@
 {
   "name": "codex-rebuild",
   "productName": "Codex",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Codex Electron App - Cross-platform Build",
   "main": "src/.vite/build/main.js",
   "scripts": {
     "start": "node scripts/start-dev.js",
     "dev": "node scripts/start-dev.js",
-
-    "patch": "node scripts/patch-copyright.js && node scripts/patch-i18n.js && node scripts/patch-process-polyfill.js",
-
+    "patch": "node scripts/patch-i18n.js",
     "forge:package": "electron-forge package",
     "forge:make": "npm run patch && electron-forge make",
-
     "build": "npm run build:current",
     "build:current": "npm run forge:make",
-
     "build:mac": "npm run patch && npm run build:mac-arm64 && npm run build:mac-x64",
     "build:mac-arm64": "npm run patch && electron-forge make --platform=darwin --arch=arm64",
     "build:mac-x64": "npm run patch && electron-forge make --platform=darwin --arch=x64",
-
     "build:win": "npm run build:win-x64",
     "build:win-x64": "npm run patch && electron-forge make --platform=win32 --arch=x64",
-
     "build:linux": "npm run patch && npm run build:linux-x64 && npm run build:linux-arm64",
     "build:linux-x64": "npm run patch && electron-forge make --platform=linux --arch=x64",
     "build:linux-arm64": "npm run patch && electron-forge make --platform=linux --arch=arm64",
-
     "build:all": "npm run build:mac && npm run build:win && npm run build:linux",
-
     "postinstall": "npm run rebuild:native",
     "rebuild:native": "electron-rebuild"
   },
@@ -62,7 +54,7 @@
     "zod": "^4.1.13"
   },
   "optionalDependencies": {
-    "@cometix/codex": "latest",
+    "@cometix/codex": "^0.105.0-cometix",
     "electron-liquid-glass": "1.1.1"
   },
   "codexBuildFlavor": "prod",
