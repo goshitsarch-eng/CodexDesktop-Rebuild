@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node scripts/start-dev.js",
     "dev": "node scripts/start-dev.js",
-    "patch": "node scripts/patch-copyright.js && node scripts/patch-i18n.js && node scripts/patch-sunset.js && node scripts/patch-devtools.js",
+    "patch": "node scripts/patch-copyright.js && node scripts/patch-i18n.js && node scripts/patch-sunset.js && node scripts/patch-devtools.js && node scripts/patch-epipe.js",
     "forge:package": "electron-forge package",
     "forge:make": "npm run patch && electron-forge make",
     "build": "npm run build:current",
@@ -35,6 +35,7 @@
     "@electron-forge/plugin-fuses": "^7.10.2",
     "@electron/fuses": "^1.8.0",
     "@electron/rebuild": "^3.7.1",
+    "@reforged/maker-appimage": "^5.2.0",
     "electron": "40.0.0"
   },
   "dependencies": {

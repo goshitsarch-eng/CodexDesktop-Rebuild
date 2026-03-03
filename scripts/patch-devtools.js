@@ -40,7 +40,7 @@ function walkAST(node, visitor) {
   for (const key of Object.keys(node)) {
     const child = node[key];
     if (Array.isArray(child)) {
-      child.forEach(c => walkAST(c, visitor));
+      child.forEach(c => { if (c && typeof c === "object" && c.type) walkAST(c, visitor); });
     } else if (child && typeof child === "object" && child.type) {
       walkAST(child, visitor);
     }

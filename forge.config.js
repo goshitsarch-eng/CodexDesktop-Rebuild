@@ -91,8 +91,9 @@ module.exports = {
 
       // 检查：filePath 是否是某个白名单路径的前缀（即父目录），
       // 或者 filePath 是否在某个白名单路径之下（即子文件/子目录）
+      // 使用目录边界感知匹配，避免 /src/webviewX 误匹配 /src/webview
       for (const prefix of allowedPrefixes) {
-        if (prefix.startsWith(filePath) || filePath.startsWith(prefix)) {
+        if (filePath === prefix || prefix.startsWith(filePath + "/") || filePath.startsWith(prefix + "/")) {
           return false;
         }
       }
@@ -178,6 +179,18 @@ module.exports = {
           bin: "Codex",
           license: "Apache-2.0",
           homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild",
+          icon: "./resources/electron.png",
+        },
+      },
+    },
+    // Linux AppImage
+    {
+      name: "@reforged/maker-appimage",
+      config: {
+        options: {
+          name: "Codex",
+          bin: "Codex",
+          categories: ["Development", "Utility"],
           icon: "./resources/electron.png",
         },
       },

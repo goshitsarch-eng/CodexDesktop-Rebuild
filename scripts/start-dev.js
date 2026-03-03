@@ -85,6 +85,6 @@ const child = spawn(electronBin, ['.'], {
   },
 });
 
-child.on('close', (code) => {
-  process.exit(code);
+child.on('close', (code, signal) => {
+  process.exit(signal ? 1 : code);
 });

@@ -123,7 +123,7 @@ function getChainedCallAt(node, method) {
     const callee = current.callee;
     if (callee?.type === "MemberExpression") {
       const prop = callee.property;
-      const name = prop?.type === "Identifier" ? prop.name : null;
+      const name = prop?.type === "Identifier" ? prop.name : prop?.type === "Literal" ? prop.value : null;
       if (name === method) return current;
       current = callee.object;
     } else {
